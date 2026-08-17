@@ -1,7 +1,18 @@
 # File functions.custom.php: Cotonti Custom Functions Guide
 
 This guide provides a detailed description of ten functions designed to determine the owner or author of content. Each function includes code examples and usage instructions.
+
+
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/webitproff/functions.custom.php-cotonti/releases)
+[![Cotonti Compatibility](https://img.shields.io/badge/Cotonti-1.0-orange.svg)](https://github.com/Cotonti/Cotonti)
+[![PHP](https://img.shields.io/badge/PHP-8.5-purple.svg)](https://www.php.net/releases/8_4_0.php)
+[![MySQL](https://img.shields.io/badge/MySQL-8.4-blue.svg)](https://www.mysql.com/)
+[![License](https://img.shields.io/badge/license-BSD-blue.svg)](https://github.com/webitproff/functions.custom.php-cotonti/blob/main/LICENSE)
+
+All the presented functions are used as standard solutions when you need to approach a task "in your own way" or when extensions from other developers require it. You can add your own custom functions to this file as you wish, and call them in your extensions or templates.
+
 <img width="1536" height="1024" alt="File functions.custom.php - Cotonti Custom Functions Guide" src="https://github.com/user-attachments/assets/19ca83f4-cd89-4e43-b0dd-cafdf9cf2e5b" />
+
 
 
 ## Table of Contents
@@ -492,6 +503,8 @@ ___
 # Руководство по пользовательским функциям Cotonti
 
 Это руководство содержит подробное описание четырех функций, предназначенных для определения владельца или автора контента. Каждая функция снабжена примерами кода и инструкциями по использованию.
+
+Все представленные функции используются как типовые решения, когда нужно к задаче подойти "по-своему" или когда этого требуют расширения других разработчиков. Этот файл можно дополнять своими пользовательскими функциями как вам угодно, и вызывать их в своих расширениях или шаблонах.
 
 ## Оглавление
 
