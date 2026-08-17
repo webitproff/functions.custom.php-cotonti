@@ -1,6 +1,8 @@
-# functions.custom.php-cotonti Cotonti Custom Functions Guide
+# File functions.custom.php: Cotonti Custom Functions Guide
 
 This guide provides a detailed description of ten functions designed to determine the owner or author of content. Each function includes code examples and usage instructions.
+<img width="1536" height="1024" alt="File functions.custom.php - Cotonti Custom Functions Guide" src="https://github.com/user-attachments/assets/19ca83f4-cd89-4e43-b0dd-cafdf9cf2e5b" />
+
 
 ## Table of Contents
 
