@@ -48,6 +48,13 @@
  *
  * - cot_langfile_custom($name, $type = 'plug', $default = 'en')
  *   Загружает пользовательский языковой файл для модуля или плагина.
+ *
+ * - cot_tpl_url($base, $type = 'module', $admin = null)
+ *   Возвращает абсолютный URL к файлу шаблона по его имени в параметрах,
+ *   например, {PHP|cot_tpl_url('forums.editpost')}
+ *
+ * - cot_debug_tpl_url()
+ *   Возвращает абсолютный URL текущего файла шаблона.
  */
  
 defined('COT_CODE') or die('Wrong URL');
@@ -58,213 +65,286 @@ global $db, $db_structure, $cfg, $cot_extrafields, $L;
 // Объявление глобальной переменной структуры
 global $structure;
 
+
 /**
- * Загружает структуру категорий из базы данных с учетом иерархии и дополнительных полей
+ * Загружает полное дерево категорий структуры из БД в глобальный массив $structure.
+ *
+ * Переопределяет стандартную функцию ядра cot_load_structure() и добавляет:
+ *  - кеширование собранного дерева в Cot::$cache->db с версионным ключом и TTL;
+ *  - обратный индекс subcats (area → родитель → [дети]) — требуется кастомными
+ *    модулями (например, market), которые не используют cot_structure_children();
+ *  - защиту от битых данных (пустой/нестроковый structure_code) с логированием;
+ *  - graceful degradation при отсутствии родителя (категория становится корнем);
+ *  - вызов хука 'structure' внутри цикла по строкам — как в стандартном Cotonti.
+ *
+ * ОЖИДАНИЯ ОТ ОКРУЖЕНИЯ:
+ *  - global $db_structure  — имя таблицы структуры (например, 'x92374_structure');
+ *  - global $cot_extrafields — реестр доп. полей; ключ [$db_structure] может быть null;
+ *  - global $structure      — целевой массив; пишем в него, а не в Cot::$structure,
+ *                             чтобы плагины с 'global $structure;' в хуке 'structure'
+ *                             видели актуальные данные;
+ *  - Cot::$cache            — объект кеша; может быть null или не иметь ->db;
+ *  - Cot::$cfg['separator'] — разделитель для построения tpath.
+ *
+ * ВЕРСИОНИРОВАНИЕ КЕША:
+ *  Ключ кеша содержит $cacheVersion. При изменении формата $structure
+ *  (добавление/переименование/удаление ключей категории) ОБЯЗАТЕЛЬНО
+ *  увеличивайте $cacheVersion, иначе старый кеш будет прочитан и вернёт
+ *  устаревшую структуру. v1 — без 'subcats', v2 — с 'subcats'.
+ *
+ * ИНВАЛИДАЦИЯ:
+ *  Точечно: Cot::$cache->db->remove('structure_all_v2', 'system');
+ *  Полностью: Cot::$cache->clear();
+ *  При вызове API cot_structure_add()/update()/delete() из своего кода
+ *  инвалидацию выполняет вызывающий, а не эта функция.
  *
  * @return void
  */
 function cot_load_structure_custom()
 {
-    // Доступ к глобальным переменным
-    global $db, $db_structure, $cfg, $cot_extrafields, $structure;
-    // Инициализация массива структуры
-    $structure = [];
-    // Инициализация массива подкатегорий
-    $subcats = [];
+    // Объявляем глобальные переменные, которые используем ниже.
+    // $structure — это целевой массив; пишем в него, а не в Cot::$structure.
+    // Cot::$structure и $structure связаны по ссылке в Cot::init(), поэтому
+    // плагины, делающие 'global $structure;' в хуке 'structure', увидят изменения.
+    global $db_structure, $cot_extrafields, $structure;
 
-    // Выбор SQL-запроса в зависимости от режима обновления
-    if (defined('COT_UPGRADE')) {
-        // Запрос для режима обновления, сортировка только по пути
-        $sql = $db->query("SELECT * FROM $db_structure ORDER BY COALESCE(structure_path, '') ASC");
-    } else {
-        // Запрос для обычного режима, сортировка по области и пути
-        $sql = $db->query("SELECT * FROM $db_structure ORDER BY structure_area ASC, COALESCE(structure_path, '') ASC");
+    // Версия формата массива $structure. Менять при изменении состава ключей.
+    $cacheVersion = 2;
+
+    // Время жизни кеша в секундах (24 часа). По истечении кеш будет перестроен из БД.
+    $cacheTtl = 86400;
+
+    // Итоговый ключ кеша: включает версию, чтобы старый формат не читался как новый.
+    $cacheKey = 'structure_all_v' . $cacheVersion;
+
+    // ================================ 1. Кеш ================================
+    // Если кеш доступен и в нём лежит непустой массив — берём оттуда и выходим.
+    // Проверяем и Cot::$cache (объект), и Cot::$cache->db (драйвер БД).
+    if (Cot::$cache && Cot::$cache->db) {
+
+        // Читаем значение из пространства 'system' (общий кеш сайта).
+        $cached = Cot::$cache->db->get($cacheKey, 'system');
+
+        // is_array + !empty — защита от мусора в кеше (false, null, повреждённая строка).
+        if (is_array($cached) && !empty($cached)) {
+
+            // Присваиваем глобальному $structure — это и есть выход из функции.
+            $structure = $cached;
+
+            // Возврат без построения дерева из БД.
+            return;
+        }
     }
 
-    // Инициализация массивов для путей, текстовых путей и шаблонов
+    // ============================ 2. Сборка дерева ============================
+    // Обнуляем целевой массив: даже если он был частично заполнен выше, начинаем чисто.
+    $structure = [];
+
+    // $path[rpath] = путь из КОДОВ (например, 'electronics.smartphones').
+    // Нужен для построения иерархии и для cot_structure_children()/parents().
     $path = [];
+
+    // $tpath[rpath] = путь из ЗАГОЛОВКОВ (например, 'Electronics / Smartphones').
+    // Нужен для готовых хлебных крошек без дополнительного построения.
     $tpath = [];
+
+    // $tpls[code] = код шаблона категории. Используется для разрешения 'same_as_parent'.
     $tpls = [];
 
-    // Обработка каждой записи из результата запроса
+    // $subcats[area][parentCode] = [childCode, ...].
+    // Обратный индекс «родитель → прямые дети». Строится за один проход,
+    // затем присваивается каждой категории в ключ 'subcats' (см. шаг 3).
+    // Нужен кастомным модулям, которые не вызывают cot_structure_children()
+    // (например, market), а читают $structure[area][code]['subcats'] напрямую.
+    $subcats = [];
+
+    // Список аномалий (битые/сиротские строки). Логируем после цикла,
+    // не прерывая работу — graceful degradation важнее, чем падение сайта.
+    $anomalies = [];
+
+    // Порядок сортировки критичен: родитель должен обрабатываться раньше детей,
+    // иначе $path[$parentRpath] и $tpath[$parentRpath] ещё не будут известны.
+    // В режиме COT_UPGRADE таблица может быть без structure_area — сортируем только по path.
+    $orderBy = defined('COT_UPGRADE')
+        ? 'structure_path ASC'
+        : 'structure_area ASC, structure_path ASC';
+
+    // Читаем все строки таблицы структуры. quoteTableName защищает от спецсимволов
+    // в имени таблицы (например, при наличии префикса вида x92374_).
+    $sql = Cot::$db->query(
+        'SELECT * FROM ' . Cot::$db->quoteTableName($db_structure) . ' ORDER BY ' . $orderBy
+    );
+
+    // Список файлов плагинов, подписанных на хук 'structure'.
+    // Хук вызывается ВНУТРИ цикла по строкам (как в стандартном Cotonti),
+    // чтобы плагины видели $row текущей категории и могли её модифицировать.
+    $extp = cot_getextplugins('structure');
+
+    // Разделитель для построения tpath. Если в $cfg['separator'] нет HTML-тегов —
+    // оборачиваем в пробелы (например, ' / '), иначе берём дефолтный ' / '.
+    // Это защита от того, что кто-то положил в конфиг голый тег без пробелов.
+    $separator = Cot::$cfg['separator'] === strip_tags(Cot::$cfg['separator'])
+        ? ' ' . Cot::$cfg['separator'] . ' '
+        : ' / ';
+
+    // Итерируем по всем строкам таблицы структуры.
     foreach ($sql->fetchAll() as $row) {
-        // Пропуск записей с пустым или нестроковым кодом или областью
-        if (empty($row['structure_code']) || !is_string($row['structure_code']) || empty($row['structure_area']) || !is_string($row['structure_area'])) {
+
+        // Базовая защита от битых данных: пустой или нестроковый structure_code.
+        // В схеме БД поле NOT NULL, но при прямом SQL-импорте или ручной правке
+        // туда может попасть мусор. Пропускаем и логируем — не падаем.
+        if (empty($row['structure_code']) || !is_string($row['structure_code'])) {
+            $anomalies[] = "Skipped row with empty/invalid structure_code (id={$row['structure_id']})";
             continue;
         }
 
-        // Присваивание кода категории
-        $row['structure_code'] = $row['structure_code'];
-        // Установка пути категории, если не указан — использование кода
-        $row['structure_path'] = !empty($row['structure_path']) && is_string($row['structure_path']) ? $row['structure_path'] : $row['structure_code'];
-        // Присваивание области категории
-        $row['structure_area'] = $row['structure_area'];
-        // Установка заголовка, если не указан — пустая строка
-        $row['structure_title'] = !empty($row['structure_title']) && is_string($row['structure_title']) ? $row['structure_title'] : '';
-        // Установка описания, если не указано — пустая строка
-        $row['structure_desc'] = !empty($row['structure_desc']) && is_string($row['structure_desc']) ? $row['structure_desc'] : '';
-        // Установка иконки, если не указана — пустая строка
-        $row['structure_icon'] = !empty($row['structure_icon']) && is_string($row['structure_icon']) ? $row['structure_icon'] : '';
-        // Приведение флага блокировки к целому числу
-        $row['structure_locked'] = isset($row['structure_locked']) ? (int)$row['structure_locked'] : 0;
-        // Приведение счетчика к целому числу
-        $row['structure_count'] = isset($row['structure_count']) ? (int)$row['structure_count'] : 0;
-        // Установка шаблона, если не указан — использование кода
-        $row['structure_tpl'] = !empty($row['structure_tpl']) && is_string($row['structure_tpl']) ? $row['structure_tpl'] : $row['structure_code'];
-        // Приведение идентификатора к целому числу
-        $row['structure_id'] = isset($row['structure_id']) ? (int)$row['structure_id'] : 0;
+        // Короткие локальные псевдонимы — читаемость ниже и меньше обращений к массиву.
+        $rpath = $row['structure_path']; // числовой путь из БД, например '100.100'
+        $code  = $row['structure_code']; // код категории, например 'smartphones'
+        $area  = $row['structure_area']; // область (расширение), например 'page'
 
-        // Поиск последней точки в пути
-        $last_dot = mb_strrpos($row['structure_path'], '.');
+        // Пустой structure_tpl означает «использовать structure_code как шаблон».
+        // same_as_parent и конкретный код оставляем как есть — обработаем ниже.
+        $row['structure_tpl'] = empty($row['structure_tpl'])
+            ? $code
+            : $row['structure_tpl'];
 
-        // Обработка иерархического пути
-        if ($last_dot !== false) {
-            // Извлечение родительского пути
-            $path1 = mb_substr($row['structure_path'], 0, $last_dot);
-            // Формирование полного пути
-            $path[$row['structure_path']] = !empty($path[$path1]) ? $path[$path1] . '.' . $row['structure_code'] : $row['structure_code'];
-            // Определение разделителя для текстового пути
-            $separator = (strip_tags($cfg['separator']) === $cfg['separator']) ? ' ' . $cfg['separator'] . ' ' : ' \ ';
-            // Формирование текстового пути
-            $tpath[$row['structure_path']] = !empty($tpath[$path1]) ? $tpath[$path1] . $separator . $row['structure_title'] : $row['structure_title'];
-            // Определение родительской категории
-            $parent_dot = mb_strrpos($path[$path1] ?? '', '.');
-            $parent = ($parent_dot !== false) ? mb_substr($path[$path1], $parent_dot + 1) : ($path[$path1] ?? $row['structure_code']);
-            // Добавление кода категории в массив подкатегорий
-            $subcats[$row['structure_area']][$parent][] = $row['structure_code'];
+        // Ищем последнюю точку в числовом пути. Если её нет — это корень,
+        // если есть — часть до неё является путём родителя.
+        $lastDot = mb_strrpos($rpath, '.');
+
+        // Ветвление: корень или ребёнок.
+        if ($lastDot > 0) {
+            // Ребёнок. Вычисляем путь родителя (всё до последней точки).
+            $parentRpath = mb_substr($rpath, 0, $lastDot);
+
+            // Проверяем, что родитель уже обработан (гарантируется ORDER BY structure_path ASC).
+            // Если нет — значит, в БД есть «висячая» ветка (родитель удалён или путь битый).
+            if (!isset($path[$parentRpath])) {
+
+                // Аномалия: логируем, но не роняем запрос.
+                $anomalies[] = "Missing parent '{$parentRpath}' for '{$area}.{$code}'";
+
+                // Graceful degradation: считаем категорию корнем.
+                // path = её собственный код, tpath = её заголовок.
+                $path[$rpath]  = $code;
+                $tpath[$rpath] = $row['structure_title'];
+
+                // Родитель = сама себя (для разрешения same_as_parent ниже).
+                $parentCode = $code;
+
+                // ВАЖНО: $subcats НЕ пополняем — категория фактически стала корнем,
+                // у неё нет реального родителя в дереве.
+            } else {
+                // Нормальный случай: собираем путь из кодов.
+                $path[$rpath] = $path[$parentRpath] . '.' . $code;
+
+                // Собираем путь из заголовков через разделитель.
+                $tpath[$rpath] = $tpath[$parentRpath] . $separator . $row['structure_title'];
+
+                // Определяем КОД родителя — последний сегмент его path.
+                // Например, если path родителя = 'electronics', parentCode = 'electronics';
+                // если path родителя = 'electronics.smartphones', parentCode = 'smartphones'.
+                $pp = $path[$parentRpath];
+                $pd = mb_strrpos($pp, '.');
+                $parentCode = $pd > 0 ? mb_substr($pp, $pd + 1) : $pp;
+
+                // Регистрируем ребёнка в обратном индексе subcats[area][parentCode][].
+                // Это единственное место, где индекс пополняется для дочерних категорий.
+                $subcats[$area][$parentCode][] = $code;
+            }
         } else {
-            // Установка пути для корневой категории
-            $path[$row['structure_path']] = $row['structure_code'];
-            // Установка текстового пути для корневой категории
-            $tpath[$row['structure_path']] = $row['structure_title'];
-            // Установка родительской категории
-            $parent = $row['structure_code'];
+            // Корень. Нет точки — нет родителя. path = код, tpath = заголовок.
+            $path[$rpath]  = $code;
+            $tpath[$rpath] = $row['structure_title'];
+
+            // Родитель = сама себя (для разрешения same_as_parent ниже).
+            $parentCode = $code;
+
+            // Корни в $subcats не попадают: они ничьи дети.
+            // Для корней 'subcats' будет проставлен в шаге 3 как пустой массив.
         }
 
-        // Обработка шаблона, если указано 'same_as_parent'
+        // Разрешение 'same_as_parent': берём шаблон родителя, если он уже известен.
+        // Fallback — собственный код категории (чтобы 'tpl' никогда не остался
+        // буквально 'same_as_parent', как это бывает в стандартном Cotonti для корней).
         if ($row['structure_tpl'] === 'same_as_parent') {
-            // Использование шаблона родителя или кода категории
-            $row['structure_tpl'] = $tpls[$parent] ?? $row['structure_code'];
+            $row['structure_tpl'] = $tpls[$parentCode] ?? $code;
         }
 
-        // Сохранение шаблона для категории
-        $tpls[$row['structure_code']] = $row['structure_tpl'];
+        // Запоминаем итоговый шаблон категории. Нужно для её детей со 'same_as_parent'.
+        $tpls[$code] = $row['structure_tpl'];
 
-        // Формирование структуры данных категории
-        $structure[$row['structure_area']][$row['structure_code']] = [
-            // Путь категории
-            'path' => $path[$row['structure_path']],
-            // Текстовый путь категории
-            'tpath' => $tpath[$row['structure_path']],
-            // Исходный путь категории
-            'rpath' => $row['structure_path'],
-            // Идентификатор категории
-            'id' => $row['structure_id'],
-            // Шаблон категории
-            'tpl' => $row['structure_tpl'],
-            // Заголовок категории
-            'title' => $row['structure_title'],
-            // Описание категории
-            'desc' => $row['structure_desc'],
-            // Иконка категории
-            'icon' => $row['structure_icon'],
-            // Флаг блокировки
-            'locked' => $row['structure_locked'],
-            // Счетчик элементов
-            'count' => $row['structure_count'],
-            // Подкатегории
-            'subcats' => $subcats[$row['structure_area']][$row['structure_code']] ?? []
+        // Формируем запись категории в runtime-массиве.
+        // Единый формат совместим со стандартным Cotonti, за исключением 'subcats',
+        // который присваивается на шаге 3 (после полного обхода).
+        $structure[$area][$code] = [
+            'path'   => $path[$rpath],           // путь из кодов
+            'tpath'  => $tpath[$rpath],          // путь из заголовков
+            'rpath'  => $rpath,                  // исходный числовой путь
+            'id'     => (int) $row['structure_id'], // id записи, всегда int
+            'tpl'    => $row['structure_tpl'],   // разрешённый код шаблона
+            'title'  => $row['structure_title'], // заголовок для посетителя
+            'desc'   => $row['structure_desc'],  // описание
+            'icon'   => $row['structure_icon'],  // путь к иконке
+            'locked' => (int) $row['structure_locked'], // флаг блокировки, int
+            'count'  => (int) $row['structure_count'],  // счётчик материалов, int
         ];
 
-        // Обработка дополнительных полей, если они существуют
-        if (!empty($cot_extrafields[$db_structure])) {
-            // Перебор дополнительных полей
+        // Переносим значения доп. полей структуры в запись категории.
+        // В runtime ключи БЕЗ префикса 'structure_' (например, 'vendor', а не 'structure_vendor').
+        // Двойная проверка: !empty + is_array — защита от $cot_extrafields === null.
+        if (!empty($cot_extrafields[$db_structure]) && is_array($cot_extrafields[$db_structure])) {
             foreach ($cot_extrafields[$db_structure] as $exfld) {
-                // Формирование имени поля
-                $fieldName = 'structure_' . $exfld['field_name'];
-                // Добавление значения дополнительного поля в структуру
-                $structure[$row['structure_area']][$row['structure_code']][$exfld['field_name']] = $row[$fieldName] ?? null;
+                $f = $exfld['field_name'];
+                $structure[$area][$code][$f] = $row['structure_' . $f] ?? null;
             }
+        }
+
+        // Хук 'structure' — внутри цикла, как в стандартном Cotonti.
+        // Плагины получают в scope: $row (текущая строка), $structure (по глобал),
+        // $path, $tpath, $tpls, $subcats, $anomalies. Они могут модифицировать
+        // текущую категорию или уже собранные — изменения сохранятся в итоговом массиве.
+        foreach ($extp as $pl) {
+            include $pl;
         }
     }
 
-    // Финальная проверка и фильтрация структуры
-    foreach ($structure as $area => &$area_structure) {
-        // Проверка, что структура области является массивом
-        if (!is_array($area_structure)) {
-            // Инициализация пустого массива для невалидной области
-            $area_structure = [];
-            continue;
+    // ===================== 3. Присвоение subcats каждой категории =====================
+    // Проходим по всему дереву и проставляем 'subcats' (возможно пустой массив).
+    // Это нужно, потому что кастомные модули (например, market) читают
+    // $structure[$area][$code]['subcats'] напрямую и ожидают, что ключ существует.
+    // Корни и листья получат пустой массив — array_filter(...) в шаблоне отработает корректно.
+    foreach ($structure as $a => &$cats) {
+        foreach ($cats as $c => &$item) {
+            $item['subcats'] = $subcats[$a][$c] ?? [];
         }
-        // Проверка каждой записи в области
-        foreach ($area_structure as $i => &$x) {
-            // Пропуск невалидных записей
-            if (!is_array($x) || empty($x['path']) || !is_string($x['path'])) {
-                unset($area_structure[$i]);
-                continue;
-            }
-            // Установка подкатегорий
-            $x['subcats'] = $subcats[$area][$i] ?? [];
-            // Присваивание пути
-            $x['path'] = $x['path'];
-            // Установка текстового пути, если не указан — использование кода
-            $x['tpath'] = !empty($x['tpath']) && is_string($x['tpath']) ? $x['tpath'] : $i;
-            // Установка исходного пути, если не указан — использование кода
-            $x['rpath'] = !empty($x['rpath']) && is_string($x['rpath']) ? $x['rpath'] : $i;
-            // Установка заголовка, если не указан — пустая строка
-            $x['title'] = !empty($x['title']) && is_string($x['title']) ? $x['title'] : '';
-            // Установка описания, если не указано — пустая строка
-            $x['desc'] = !empty($x['desc']) && is_string($x['desc']) ? $x['desc'] : '';
-            // Установка иконки, если не указана — пустая строка
-            $x['icon'] = !empty($x['icon']) && is_string($x['icon']) ? $x['icon'] : '';
-            // Приведение счетчика к целому числу
-            $x['count'] = isset($x['count']) ? (int)$x['count'] : 0;
-            // Приведение флага блокировки к целому числу
-            $x['locked'] = isset($x['locked']) ? (int)$x['locked'] : 0;
-            // Установка шаблона, если не указан — использование кода
-            $x['tpl'] = !empty($x['tpl']) && is_string($x['tpl']) ? $x['tpl'] : $i;
-            // Приведение идентификатора к целому числу
-            $x['id'] = isset($x['id']) ? (int)$x['id'] : 0;
-        }
-        // Освобождение ссылки на последнюю запись
-        unset($x);
+        // Снимаем ссылку после внутреннего foreach — иначе следующая итерация
+        // внешнего цикла будет писать в последний элемент предыдущей области.
+        unset($item);
     }
-    // Освобождение ссылки на последнюю область
-    unset($area_structure);
+    // Снимаем ссылку после внешнего foreach — аналогично, чтобы не «прилипнуть»
+    // к последней области при возможных последующих операциях.
+    unset($cats);
 
-    // Сохранение копии структуры перед выполнением плагинов
-    $temp_structure = $structure;
-    // Выполнение плагинов, подключенных к событию structure
-    foreach (cot_getextplugins('structure') as $pl) {
-        // Восстановление структуры перед выполнением плагина
-        $structure = $temp_structure;
-        // Подключение файла плагина
-        include $pl;
-        // Проверка структуры после выполнения плагина
-        foreach ($structure as $area => &$area_structure) {
-            // Проверка, что структура области является массивом
-            if (!is_array($area_structure)) {
-                // Инициализация пустого массива для невалидной области
-                $area_structure = [];
-                continue;
-            }
-            // Проверка каждой записи в области
-            foreach ($area_structure as $i => &$x) {
-                // Пропуск невалидных записей
-                if (!is_array($x) || empty($x['path']) || !is_string($x['path'])) {
-                    unset($area_structure[$i]);
-                    continue;
-                }
-            }
-            // Освобождение ссылки на последнюю запись
-            unset($x);
-        }
-        // Освобождение ссылки на последнюю область
-        unset($area_structure);
+    // ============================ 4. Логирование аномалий ============================
+    // Пишем в лог Cotonti каждую аномалию (битые/сиротские строки).
+    // Делается после цикла, чтобы не мешать сборке; каждое сообщение — отдельно,
+    // чтобы в логе было легко фильтровать по '[structure]'.
+    foreach ($anomalies as $msg) {
+        cot_log('[structure] ' . $msg, 'adm', 'structure', 'warn');
     }
-    // Финальное восстановление структуры
-    $structure = $temp_structure;
+
+    // ============================== 5. Сохранение в кеш ==============================
+    // Кешируем только непустой результат, чтобы не «закэшировать» пустоту
+    // при временной проблеме с БД (например, при миграции).
+    // Ключ и TTL — из локальных переменных; при изменении формата массива
+    // поднимите $cacheVersion, старый кеш будет проигнорирован.
+    if (Cot::$cache && Cot::$cache->db && !empty($structure)) {
+        Cot::$cache->db->store($cacheKey, $structure, 'system', $cacheTtl);
+    }
 }
+
 
 function forums_url_structure(&$args)
 {
